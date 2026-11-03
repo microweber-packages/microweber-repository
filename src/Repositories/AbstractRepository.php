@@ -1,0 +1,1423 @@
+<?php
+
+
+namespace MicroweberPackages\Repository\Repositories;
+
+use BadMethodCallException;
+use Carbon\Carbon;
+use Closure;
+use Illuminate\Cache\CacheManager;
+use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\ModelNotFoundException;
+use Illuminate\Support\Arr;
+use Illuminate\Support\Collection;
+use Illuminate\Support\Facades\Config;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Event;
+use Illuminate\Support\MessageBag;
+use MicroweberPackages\Repository\Traits\FilterableByParams;
+use Torann\LaravelRepository\Contracts\Repository;
+use Torann\LaravelRepository\Exceptions\RepositoryException;
+use MicroweberPackages\Database\Facades\DatabaseManager;
+use MicroweberPackages\Event\Facades\EventManager;
+
+
+abstract class AbstractRepository implements Repository
+{
+    /**
+     * Cache expires constants
+     */
+    const EXPIRES_END_OF_DAY = 'eod';
+
+    /**
+     * Cache instance
+     */
+    protected static ?CacheManager $cache = null;
+
+    /**
+     * Whether cache is globally disabled.
+     */
+    public static bool $disableCache = false;
+
+    /**
+     * Flush the cache after create/update/delete events.
+     */
+    protected bool $eventFlushCache = true;
+
+    /**
+     * Global lifetime of the cache in seconds.
+     */
+    protected int $cacheSeconds = 60000;
+
+    /**
+     * In-memory request-scoped cache to avoid redundant cache hits.
+     */
+    // Per-instance request memo for cacheCallback(). MUST NOT be static: repositories are
+    // bound fresh per resolve (e.g. `option_repository` via `bind`, not `singleton`), but a
+    // `static` memo would persist for the whole PHP process and leak stale values across
+    // unrelated reads — most visibly in long-running processes (tests/queue/Octane), where a
+    // value cached by one test survived a later save_option() and was read back stale. The
+    // flushable tagged cache below remains the real cross-request cache; this is only an
+    // in-instance shortcut.
+    protected array $_cacheCallbackMemory = [];
+
+    /**
+     * In-memory cache for loaded models by ID.
+     */
+    public static array $_loaded_models_cache_get = [];
+
+    /**
+     * Searching operator.
+     *
+     * This might be different when using a
+     * different database driver.
+     *
+     * @var string
+     */
+    public static $searchOperator = 'LIKE';
+
+    /**
+     * @var \Illuminate\Database\Eloquent\Model
+     */
+    protected $modelInstance;
+
+    /**
+     * The errors message bag instance
+     *
+     * @var \Illuminate\Support\MessageBag
+     */
+    protected $errors;
+
+    /**
+     * @var \Illuminate\Database\Eloquent\Builder
+     */
+    protected $query;
+
+    /**
+     * Global query scope.
+     *
+     * @var array
+     */
+    protected $scopeQuery = [];
+
+    /**
+     * Valid orderable columns.
+     *
+     * @return array
+     */
+    protected $orderable = [];
+
+    /**
+     * Default order by column and direction pairs.
+     *
+     * @var array
+     */
+    protected $orderBy = [];
+
+    /**
+     * One time skip of ordering. This is done when the
+     * ordering is overwritten by the orderBy method.
+     *
+     * @var bool
+     */
+    protected $skipOrderingOnce = false;
+
+    /**
+     * A set of keys used to perform range queries.
+     *
+     * @var array
+     */
+    protected $range_keys = [
+        'lt', 'gt',
+        'bt', 'ne',
+    ];
+
+    public static $limit = 30;
+
+    /**
+     * Create a new Repository instance
+     *
+     * @throws RepositoryException
+     */
+    public function __construct()
+    {
+        $this->makeModel();
+        $this->boot();
+    }
+
+    /**
+     * The "booting" method of the repository.
+     */
+    public function boot()
+    {
+
+
+        Event::listen(['eloquent.saved: *', 'eloquent.created: *', 'eloquent.deleted: *'], function ($context) {
+            $this->clearCache();
+        });
+
+        //    $this->getModel()::observe(RepositoryModelObserver::class);
+
+
+    }
+
+    // ── Cache methods (inlined from former CacheableRepository trait) ──
+
+    public static function setCacheInstance(CacheManager $cache): void
+    {
+        self::$cache = $cache;
+    }
+
+    public static function getCacheInstance(): CacheManager
+    {
+        if (self::$cache === null) {
+            self::$cache = app('cache');
+        }
+
+        return self::$cache;
+    }
+
+    public static function disableCache(): void
+    {
+        self::$disableCache = true;
+    }
+
+    public function skippedCache(): bool
+    {
+        if (self::$disableCache) {
+            return true;
+        }
+
+        if (Config::get('microweber.disable_model_cache')) {
+            return true;
+        }
+
+        return config('repositories.cache_enabled', false) === false
+            || app('request')->has(config('repositories.cache_skip_param', 'skipCache')) === true;
+    }
+
+    public function getCacheKey(string $method, $args = null, array $tag = []): string
+    {
+        if ($method === 'getById' && is_array($args) && isset($args[0]) && is_numeric($args[0])) {
+            return sprintf(
+                '%s-%s--%s-%s-%s',
+                app()->getLocale(),
+                implode('-', $tag),
+                $method,
+                intval($args[0]),
+                intval(function_exists('is_https') ? is_https() : false)
+            );
+        }
+
+        $hashArgs = [];
+        foreach ($args as $k => $a) {
+            if (is_object($a) && $a instanceof Closure) {
+                $hashArgs[$k] = function_exists('hashClosure') ? hashClosure($a) : spl_object_id($a);
+            } else {
+                $hashArgs[$k] = $a;
+            }
+        }
+
+        return sprintf(
+            '%s-%s--%s-%s-%s',
+            app()->getLocale(),
+            implode('-', $tag),
+            $method,
+            crc32(json_encode($hashArgs)),
+            intval(function_exists('is_https') ? is_https() : false)
+        );
+    }
+
+    public function cacheCallback(string $method, $args, Closure $callback, $time = null)
+    {
+        $skipCache = false;
+
+        if ($this->skippedCache() === true) {
+            $skipCache = true;
+        } elseif (is_array($args) && isset($args[0]) && is_array($args[0]) && isset($args[0]['no_cache']) && $args[0]['no_cache']) {
+            $skipCache = true;
+        }
+
+        if ($skipCache === true) {
+            return call_user_func($callback);
+        }
+
+        $tag = $this->generateCacheTags();
+        $cacheKey = $this->getCacheKey($method, $args, $tag);
+        $_cacheCallback_memory_key = implode('-', $tag) . $cacheKey;
+
+        if (isset($this->_cacheCallbackMemory[$_cacheCallback_memory_key])) {
+            return $this->_cacheCallbackMemory[$_cacheCallback_memory_key];
+        }
+
+        return $this->_cacheCallbackMemory[$_cacheCallback_memory_key] = self::getCacheInstance()->tags($tag)->remember(
+            $cacheKey,
+            $this->getCacheExpiresTime($time),
+            $callback
+        );
+    }
+
+    public function generateCacheTags(): array
+    {
+        return ['repositories', $this->getModel()->getTable()];
+    }
+
+    public function clearCache()
+    {
+        $this->_cacheCallbackMemory = [];
+        self::$_loaded_models_cache_get = [];
+
+        if ($this->eventFlushCache === false || config('repositories.cache_enabled', false) === false) {
+            return false;
+        }
+
+        $this->eventFlushCache = false;
+        self::$disableCache = true;
+    }
+
+    protected function getCacheExpiresTime($time = null): int
+    {
+        if ($time === self::EXPIRES_END_OF_DAY) {
+            return class_exists(Carbon::class)
+                ? round(Carbon::now()->secondsUntilEndOfDay() / 60)
+                : $this->cacheSeconds;
+        }
+
+        return $time ?: $this->cacheSeconds;
+    }
+
+    // ── End cache methods ──
+
+    /**
+     * Return model instance.
+     *
+     * @return Model
+     */
+    public function getModel() : Model
+    {
+        return $this->modelInstance;
+    }
+
+    /**
+     * Reset internal Query
+     *
+     * @return $this
+     */
+    protected function scopeReset()
+    {
+        $this->scopeQuery = [];
+
+        $this->query = $this->newQuery();
+
+        return $this;
+    }
+
+    /**
+     * Get a new entity instance
+     *
+     * @param array $attributes
+     *
+     * @return  \Illuminate\Database\Eloquent\Model
+     */
+    public function getNew(array $attributes = [])
+    {
+        $this->errors = new MessageBag;
+
+        return $this->modelInstance->newInstance($attributes);
+    }
+
+    /**
+     * Get a new query builder instance with the applied
+     * the order by and scopes.
+     *
+     * @param bool $skipOrdering
+     *
+     * @return self
+     */
+    public function newQuery($skipOrdering = false)
+    {
+        $this->query = $this->getNew()->newQuery();
+
+        // Apply order by
+        if ($skipOrdering === false && $this->skipOrderingOnce === false) {
+            foreach ($this->getOrderBy() as $column => $dir) {
+                $this->query->orderBy($column, $dir);
+            }
+        }
+
+        // Reset the one time skip
+        $this->skipOrderingOnce = false;
+
+        $this->applyScope();
+
+        return $this;
+    }
+
+    /**
+     * Find data by its primary key.
+     *
+     * @param mixed $id
+     * @param array $columns
+     *
+     * @return Model|Collection
+     */
+    public function find($id, $columns = ['*'])
+    {
+        $this->newQuery();
+
+        return $this->query->find($id, $columns);
+    }
+
+    /**
+     * Find a model by its primary key or throw an exception.
+     *
+     * @param string $id
+     * @param array $columns
+     *
+     * @return \Illuminate\Database\Eloquent\Model
+     *
+     * @throws \Illuminate\Database\Eloquent\ModelNotFoundException
+     */
+    public function findOrFail(mixed $id, array $columns = ['*']): Model|null
+    {
+        $this->newQuery();
+
+        if ($result = $this->query->find($id, $columns)) {
+            return $result;
+        }
+
+        throw (new ModelNotFoundException)->setModel($this->model);
+    }
+
+    /**
+     * Find data by field and value
+     *
+     * @param string $field
+     * @param string $value
+     * @param array $columns
+     *
+     * @return Model|Collection
+     */
+    public function findBy($field, $value, $columns = ['*'])
+    {
+        $this->newQuery();
+
+        return $this->query->where($field, '=', $value)->first($columns);
+    }
+
+    /**
+     * Find data by field
+     *
+     * @param string $attribute
+     * @param mixed $value
+     * @param array $columns
+     *
+     * @return mixed
+     */
+    public function findAllBy($attribute, $value, $columns = ['*'])
+    {
+        $this->newQuery();
+
+        // Perform where in
+        if (is_array($value)) {
+            return $this->query->whereIn($attribute, $value)->get($columns);
+        }
+
+        return $this->query->where($attribute, '=', $value)->get($columns);
+    }
+
+    /**
+     * Find data by multiple fields
+     *
+     * @param array $where
+     * @param array $columns
+     *
+     * @return mixed
+     */
+    public function findWhere(array $where, $columns = ['*'])
+    {
+        $this->newQuery();
+
+        foreach ($where as $field => $value) {
+            if (is_array($value)) {
+                list($field, $condition, $val) = $value;
+                $this->query->where($field, $condition, $val);
+            } else {
+                $this->query->where($field, '=', $value);
+            }
+        }
+
+        return $this->query->get($columns);
+    }
+
+
+    public function findById($id)
+    {
+        $this->newQuery();
+        return $this->query
+            ->where('id', $id)
+            ->limit(1)
+            ->first();
+    }
+
+    /**
+     * Order results by.
+     *
+     * @param string $column
+     * @param string $direction
+     *
+     * @return self
+     */
+    public function orderBy(mixed $column, string|null $direction): static
+    {
+        // Ensure the sort is valid
+        if (in_array($column, $this->getOrderable()) === false
+            && array_key_exists($column, $this->getOrderable()) === false
+        ) {
+            return $this;
+        }
+
+        // One time skip
+        $this->skipOrderingOnce = true;
+
+        return $this->addScopeQuery(function ($query) use ($column, $direction) {
+
+            // Get valid sort order
+            $direction = in_array(strtolower($direction), ['desc', 'asc']) ? $direction : 'asc';
+
+            // Check for table column mask
+            $column = Arr::get($this->getOrderable(), $column, $column);
+
+            return $query->orderBy($this->appendTableName($column), $direction);
+        });
+    }
+
+    /**
+     * Return the order by array.
+     *
+     * @return array
+     */
+    public function getOrderBy()
+    {
+        return $this->orderBy;
+    }
+
+    /**
+     * Return orderable array.
+     *
+     * @return array
+     */
+    public function getOrderable()
+    {
+        return $this->orderable;
+    }
+
+    /**
+     * Filter results by given query params.
+     *
+     * @param string|array $queries
+     *
+     * @return self
+     */
+    public function search(string|array|null $queries, array $options = []): static
+    {
+        // Adjust for simple search queries
+        if (is_string($queries)) {
+            $queries = [
+                'query' => $queries,
+            ];
+        }
+
+        return $this->addScopeQuery(function ($query) use ($queries) {
+            // Keep track of what tables have been joined and their aliases
+            $joined = [];
+
+            foreach ($this->getModel()->getSearchable() as $param => $columns) {
+                // It doesn't always have to map to something
+                $param = is_numeric($param) ? $columns : $param;
+
+                // Get param value
+                $value = Arr::get($queries, $param, '');
+
+                // Validate value
+                if ($value === '' || $value === null) {
+                    continue;
+                }
+
+                // Columns should be an array
+                $columns = (array)$columns;
+
+                // Loop though the columns and look for relationships
+                foreach ($columns as $key => $column) {
+                    @list($joining_table, $options) = explode(':', $column);
+
+                    if ($options !== null) {
+                        @list($column, $foreign_key, $related_key, $alias) = explode(',', $options);
+
+                        // Join the table if it hasn't already been joined
+                        if (isset($joined[$joining_table]) == false) {
+                            $joined[$joining_table] = $this->addSearchJoin(
+                                $query,
+                                $joining_table,
+                                $foreign_key,
+                                $related_key ?: $param, // Allow for related key overriding
+                                $alias
+                            );
+                        }
+
+                        // Set a new column search
+                        $columns[$key] = "{$joined[$joining_table]}.{$column}";
+                    }
+                }
+
+                // Perform a range based query if the range is valid
+                // and the separator matches.
+                if ($this->createSearchRangeClause($query, $value, $columns)) {
+                    continue;
+                }
+
+                // Create standard query
+                if (count($columns) > 1) {
+                    $query->where(function ($q) use ($columns, $param, $value) {
+                        foreach ($columns as $column) {
+                            $this->createSearchClause($q, $param, $column, $value, 'or');
+                        }
+                    });
+                } else {
+                    $this->createSearchClause($query, $param, $columns[0], $value);
+                }
+            }
+
+            // Ensure only the current model's table attributes are return
+            if (!$this->_selectIsAdded) {
+                $query->addSelect([
+                    $this->getModel()->getTable() . '.*',
+                ]);
+            }
+            return $query;
+        });
+    }
+
+
+    private $_selectIsAdded = false;
+
+    public function select($columns)
+    {
+        $this->_selectIsAdded = true;
+        return $this->addScopeQuery(function ($query) use ($columns) {
+            foreach ($columns as $key => $column) {
+                $query->addSelect([
+                    $this->getModel()->getTable() . '.' . $column,
+                ]);
+            }
+
+            return $query;
+
+        });
+
+
+    }
+
+    /**
+     * Set the "limit" value of the query.
+     *
+     * @param int $limit
+     *
+     * @return self
+     */
+    public function limit($limit)
+    {
+        return $this->addScopeQuery(function ($query) use ($limit) {
+            return $query->limit($limit);
+        });
+    }
+
+    /**
+     * Retrieve all data of repository
+     *
+     * @param array $columns
+     *
+     * @return Collection
+     */
+    public function all(array $columns = ['*']): Collection
+    {
+        $this->newQuery();
+
+        return $this->query->get($columns);
+    }
+
+    /**
+     * Retrieve the "count" result of the query.
+     *
+     * @param array $columns
+     *
+     * @return int
+     */
+    public function count(array $columns = ['*']): int
+    {
+        $this->newQuery();
+
+        return $this->query->count($columns);
+    }
+
+    /**
+     * Get an array with the values of a given column.
+     *
+     * @param string $value
+     * @param string $key
+     *
+     * @return array
+     */
+    public function pluck(string $value, ?string $key = null): array
+    {
+        $this->newQuery();
+
+        $lists = $this->query->pluck($value, $key);
+
+        if (is_array($lists)) {
+            return $lists;
+        }
+
+        return $lists->all();
+    }
+
+    /**
+     * Retrieve all data of repository, paginated
+     *
+     * @param int $per_page
+     * @param array $columns
+     * @param string $page_name
+     * @param int|null $page
+     *
+     * @return \Illuminate\Contracts\Pagination\LengthAwarePaginator
+     */
+    public function paginate($per_page = null, $columns = ['*'], $page_name = 'page', $page = null)
+    {
+        // Get the default per page when not set
+        $per_page = $per_page ?: config('repositories.per_page', 15);
+
+        // Get the per page max
+        $per_page_max = config('repositories.max_per_page', 100);
+
+        // Ensure the user can never make the per
+        // page limit higher than the defined max.
+        if ($per_page > $per_page_max) {
+            $per_page = $per_page_max;
+        }
+
+        $this->newQuery();
+
+        return $this->query->paginate($per_page, $columns, $page_name, $page);
+    }
+
+    /**
+     * Retrieve all data of repository, paginated
+     *
+     * @param int $per_page
+     * @param array $columns
+     * @param string $page_name
+     * @param int|null $page
+     *
+     * @return \Illuminate\Contracts\Pagination\Paginator
+     */
+    public function simplePaginate($per_page = null, $columns = ['*'], $page_name = 'page', $page = null)
+    {
+        $this->newQuery();
+
+        // Get the default per page when not set
+        $per_page = $per_page ?: config('repositories.per_page', 15);
+
+        return $this->query->simplePaginate($per_page, $columns, $page_name, $page);
+    }
+
+    /**
+     * Save a new entity in repository
+     *
+     * @param array $attributes
+     *
+     * @return Model|bool
+     */
+    public function create(array $attributes): Model|bool
+    {
+        $entity = $this->getNew($attributes);
+
+        if ($entity->save()) {
+            $this->clearCache();
+
+            return $entity;
+        }
+
+        return false;
+    }
+
+    /**
+     *
+     * @param array $attributes
+     *
+     * @return int|bool
+     */
+    public function save($data)
+    {
+        $this->clearCache();
+
+        if (app()->bound(\MicroweberPackages\Database\DatabaseManagerService::class)) {
+            DatabaseManager::clearCache();
+        }
+
+        $updateOrCreate = 'create';
+
+        if ($data and isset($data['id']) and $data['id'] == 0) {
+            unset($data['id']);
+        }
+
+        if ($data and isset($data['id']) and $data['id'] != 0) {
+            $entity = $this->findById($data['id']);
+
+            if ($entity) {
+                $updateOrCreate = 'update';
+            }
+        }
+
+        if ($updateOrCreate === 'create') {
+            $result = $this->create($data);
+        } else {
+            $result = $this->update($entity, $data);
+        }
+
+        if ($result and isset($result->id) and $result->id > 0) {
+            return $result->id;
+        }
+        return false;
+    }
+
+    /**
+     * Update an entity with the given attributes and persist it
+     *
+     * @param Model $entity
+     * @param array $attributes
+     *
+     * @return bool
+     */
+    public function update(Model $entity, array $attributes): Model|bool
+    {
+        if ($entity->update($attributes)) {
+            $this->clearCache();
+
+            return $entity;
+        }
+
+        return false;
+    }
+
+    /**
+     * Delete a entity in repository
+     *
+     * @param mixed $entity
+     *
+     * @return bool|null
+     *
+     * @throws \Exception
+     */
+    public function delete(mixed $entity): bool
+    {
+        if (($entity instanceof Model) === false) {
+            $entity = $this->find($entity);
+        }
+
+        if ($entity->delete()) {
+            $this->clearCache();
+
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * Create model instance.
+     *
+     * @return \Illuminate\Database\Eloquent\Builder
+     * @throws RepositoryException
+     */
+    public function makeModel()
+    {
+        if (empty($this->model)) {
+            throw new RepositoryException('The model class must be set on the repository.');
+        }
+
+        return $this->modelInstance = new $this->model;
+    }
+
+    /**
+     * Get a new query builder instance with the applied
+     * the order by and scopes.
+     *
+     * @param bool $skipOrdering
+     *
+     * @return \Illuminate\Database\Eloquent\Builder
+     */
+    public function getBuilder(bool $skipOrdering = false)
+    {
+        $this->newQuery($skipOrdering);
+
+        return $this->query;
+    }
+
+    /**
+     * Get the raw SQL statements for the request
+     *
+     * @return string
+     */
+    public function toSql(): string
+    {
+        $this->newQuery();
+
+        return $this->query->toSql();
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    public function hasErrors(): bool
+    {
+        return $this->getMessageBag()->has('error');
+    }
+
+
+    /**
+     * {@inheritDoc}
+     */
+    public function getMessageBag(): MessageBag
+    {
+        if ($this->message_bag === null) {
+            $this->message_bag = new MessageBag;
+        }
+
+        return $this->message_bag;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    public function addMessage(string $message, string $key = 'message'): static
+    {
+        $this->getMessageBag()->add($key, $message);
+
+        return $this;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    public function hasMessage(string $key = 'message'): bool
+    {
+        return $this->getMessageBag()->has($key);
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    public function getMessage(?string $key = null, ?string $format = null, string $default = ''): string
+    {
+        return $this->getMessageBag()->first($key, $format) ?: $default;
+    }
+    /**
+     * Return query scope.
+     *
+     * @return array
+     */
+    public function getScopeQuery()
+    {
+        return $this->scopeQuery;
+    }
+
+    /**
+     * Add query scope.
+     *
+     * @param Closure $scope
+     *
+     * @return $this
+     */
+    public function addScopeQuery(Closure $scope)
+    {
+        $this->scopeQuery[] = $scope;
+
+        return $this;
+    }
+
+    /**
+     * Apply scope in current Query
+     *
+     * @return $this
+     */
+    protected function applyScope()
+    {
+        foreach ($this->scopeQuery as $callback) {
+            if (is_callable($callback)) {
+                $this->query = $callback($this->query);
+            }
+        }
+
+        // Clear scopes
+        $this->scopeQuery = [];
+
+        return $this;
+    }
+
+    /**
+     * Add a message to the repository's error messages.
+     *
+     * @param string $message
+     * @param string $key
+     *
+     * @return self
+     */
+    public function addError(string $message): static
+    {
+        $key = 'message';
+        $this->getErrors()->add($key, $message);
+
+        return $this;
+    }
+
+    /**
+     * Get the repository's error messages.
+     *
+     * @return \Illuminate\Support\MessageBag
+     */
+    public function getErrors() : array
+    {
+        if ($this->errors === null) {
+            $this->errors = new MessageBag;
+        }
+
+        return $this->errors;
+    }
+
+    /**
+     * Get the repository's first error message.
+     *
+     * @param string $default
+     *
+     * @return string
+     */
+    public function getErrorMessage($default = '') : string
+    {
+        return $this->getErrors()->first('message') ?: $default;
+    }
+
+    /**
+     * Append table name to column.
+     *
+     * @param string $column
+     *
+     * @return string
+     */
+    protected function appendTableName($column)
+    {
+        // If missing prepend the table name
+        if (strpos($column, '.') === false) {
+            return $this->modelInstance->getTable() . '.' . $column;
+        }
+
+        // Remove alias prefix indicator
+        if (preg_match('/^_\./', $column) != false) {
+            return preg_replace('/^_\./', '', $column);
+        }
+
+        return $column;
+    }
+
+    /**
+     * Add a search where clause to the query.
+     *
+     * @param Builder $query
+     * @param string $param
+     * @param string $column
+     * @param string $value
+     * @param string $boolean
+     */
+    protected function createSearchClause(Builder $query, $param, $column, $value, $boolean = 'and')
+    {
+        if ($param === 'query') {
+            $query->where($this->appendTableName($column), self::$searchOperator, '%' . $value . '%', $boolean);
+        } elseif (is_array($value)) {
+            $query->whereIn($this->appendTableName($column), $value, $boolean);
+        } else {
+            $query->where($this->appendTableName($column), '=', $value, $boolean);
+        }
+    }
+
+    /**
+     * Add a search join to the query.
+     *
+     * @param Builder $query
+     * @param string $joining_table
+     * @param string $foreign_key
+     * @param string $related_key
+     * @param string $alias
+     *
+     * @return string
+     */
+    protected function addSearchJoin(Builder $query, $joining_table, $foreign_key, $related_key, $alias)
+    {
+        // We need to join to the intermediate table
+        $local_table = $this->getModel()->getTable();
+
+        // Set the way the table will be join, with an alias or without
+        $table = $alias ? "{$joining_table} as {$alias}" : $joining_table;
+
+        // Create an alias for the join
+        $alias = $alias ?: $joining_table;
+
+        // Create the join
+        $query->join($table, "{$alias}.{$foreign_key}", "{$local_table}.{$related_key}");
+
+        return $alias;
+    }
+
+    /**
+     * Add a range clause to the query.
+     *
+     * @param Builder $query
+     * @param string $value
+     * @param array $columns
+     *
+     * @return bool
+     */
+    protected function createSearchRangeClause(Builder $query, $value, array $columns)
+    {
+        // Skip arrays
+        if (is_array($value) === true) {
+            return false;
+        }
+
+        // Get the range type
+        $range_type = strtolower(substr($value, 0, 2));
+
+        // Perform a range based query if the range is valid
+        // and the separator matches.
+        if (substr($value, 2, 1) === ':' && in_array($range_type, $this->range_keys)) {
+            // Get the true value
+            $value = substr($value, 3);
+
+            switch ($range_type) {
+                case 'gt':
+                    $query->where($this->appendTableName($columns[0]), '>', $value, 'and');
+                    break;
+                case 'lt':
+                    $query->where($this->appendTableName($columns[0]), '<', $value, 'and');
+                    break;
+                case 'ne':
+                    $query->where($this->appendTableName($columns[0]), '<>', $value, 'and');
+                    break;
+                case 'bt':
+                    // Because this can only have two values
+                    if (count($values = explode(',', $value)) === 2) {
+                        $query->whereBetween($this->appendTableName($columns[0]), $values);
+                    }
+                    break;
+            }
+
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * Handle dynamic static method calls into the method.
+     *
+     * @param string $method
+     * @param array $parameters
+     *
+     * @return mixed
+     */
+    public function __call($method, $parameters)
+    {
+        // Check for scope method and call
+        if (method_exists($this, $scope = 'scope' . ucfirst($method))) {
+            return call_user_func_array([$this, $scope], $parameters);
+        }
+
+        $className = get_class($this);
+
+        throw new BadMethodCallException("Call to undefined method {$className}::{$method}()");
+    }
+
+
+    /**
+     * Filter results by given query params.
+     *
+     * @param string|array $queries
+     *
+     * @return self
+     */
+    public function getByParams($params = [])
+    {
+        $result = $this->cacheCallback(__FUNCTION__, func_get_args(), function () use ($params) {
+
+            $model = $this->getModel();
+
+            if (is_string($params)) {
+                $params = parse_params($params);
+            }
+
+            $params = self::unifyParams($params);
+
+            // Delegate filtering to the model's FilterableByParams trait when available
+            if (in_array(FilterableByParams::class, class_uses_recursive($model))) {
+                $this->query = $model->newQuery()->filterByParams($params);
+            } else {
+                // Legacy path for models without the trait
+                $table = $model->getTable();
+                $columns = $model->getFillable();
+                $searchable = method_exists($model, 'getSearchable') ? $model->getSearchable() : [];
+
+                $this->newQuery();
+                $this->query = self::querySelectLogic($this->query, $table, $columns, $params);
+
+                if ($params) {
+                    foreach ($params as $paramKey => $paramValue) {
+                        if (isset($this->filterMethods[$paramKey])) {
+                            $whereMethodName = $this->filterMethods[$paramKey];
+                            $this->query->$whereMethodName($paramValue);
+                            unset($params[$paramKey]);
+                        } elseif (in_array($paramKey, $searchable)) {
+                            $parseCompareSign = function_exists('db_query_parse_compare_sign_value')
+                                ? db_query_parse_compare_sign_value($paramValue)
+                                : ['compare_sign' => '=', 'value' => $paramValue];
+                            $this->query->where($table . '.' . $paramKey, $parseCompareSign['compare_sign'], $parseCompareSign['value']);
+                        }
+                    }
+                }
+
+                $this->query = self::queryKeywordLogic($this->query, $table, $columns, $params);
+                $this->query = self::queryTagsLogic($this->query, $table, $columns, $params);
+                $this->query = self::queryClosureLogic($this->query, $table, $columns, $params);
+                $this->query = self::queryExcludeIdsLogic($this->query, $table, $columns, $params);
+                $this->query = self::queryIncludeIdsLogic($this->query, $table, $columns, $params);
+
+                $this->query = self::queryLimitLogic($this->query, $table, $columns, $params);
+                $this->query = self::queryGroupByLogic($this->query, $table, $columns, $params);
+                $this->query = self::queryOrderByLogic($this->query, $table, $columns, $params);
+            }
+
+            $single = false;
+            $multiple = false;
+            $count = false;
+            if (isset($params['count']) and $params['count']) {
+                $exec = $this->query->count();
+                $count = true;
+            } else if (isset($params['page_count'])) {
+
+                $limit = self::$limit;
+                if (isset($params['limit']) and ($params['limit'] != 'no_limit')) {
+                    $limit = intval($params['limit']);
+                }
+                $page_count = $this->query->count();
+                if ($page_count > 0) {
+                    $exec = intval(ceil($page_count / $limit));
+                } else {
+                    $exec = 0;
+                }
+
+                $count = true;
+            } else if (isset($params['single']) || isset($params['one'])) {
+                $exec = $this->query->first();
+                $single = true;
+            } else {
+                $exec = $this->query->get();
+                $multiple = true;
+            }
+
+            $result = [];
+            if ($exec != null) {
+                if (is_numeric($exec)) {
+                    $result = $exec;
+                } else {
+                    $result = $exec->toArray();
+                }
+            }
+
+            if ($single || $multiple) {
+                $hookParams = [];
+                $hookParams['data'] = $result;
+                if ($single) {
+                    $hookParams['hook_overwrite_type'] = 'single';
+                } else {
+                    $hookParams['hook_overwrite_type'] = 'multiple';
+                }
+                if (is_array($result) && app()->bound(\MicroweberPackages\Event\EventService::class)) {
+                    $overwrite = EventManager::response(get_class($this) . '\\getByParams', $hookParams);
+                    if (isset($overwrite['data'])) {
+                        //     $result = $overwrite['data'];
+                    }
+                }
+            }
+
+            if ($count) {
+                if (!is_numeric($result)) {
+                    return 0;
+                }
+                return $result;
+            }
+
+            if (!empty($result)) {
+                return $result;
+            }
+
+            return [];
+        });
+
+        if (!empty($result)) {
+            return $result;
+        }
+
+        return null;
+
+    }
+
+    public static function unifyParams($params)
+    {
+        if (is_array($params)) {
+            if (isset($params['count_paging'])) {
+                $params['page_count'] = $params['count_paging'];
+                unset($params['count_paging']);
+            }
+
+            if (isset($params['orderby'])) {
+                $params['order_by'] = $params['orderby'];
+                unset($params['orderby']);
+            }
+
+            if (!isset($params['current_page']) and isset($params['page'])) {
+                // old parameter 'page', must be removed and 'current_page' must be used
+                $params['current_page'] = $params['page'];
+                unset($params['page']);
+            }
+
+            if (!isset($params['no_limit']) and isset($params['nolimit'])) {
+                $params['no_limit'] = $params['nolimit'];
+                unset($params['nolimit']);
+            }
+        }
+        return $params;
+    }
+
+
+    public function getIdsThatHaveRelation($table, $rel_type)
+    {
+        return $this->cacheCallback(__FUNCTION__, func_get_args(), function () use ($table, $rel_type) {
+
+            $result = [];
+
+            $translation_namespaces = DB::table($table)
+                ->select('rel_id')
+                ->where('rel_type', $rel_type)
+                ->groupBy('rel_id')
+                ->get();
+
+            if ($translation_namespaces) {
+                $result = $translation_namespaces->toArray();
+                if ($result and is_array($result)) {
+                    $result = array_map(function ($value) {
+                        return (array)$value;
+                    }, $result);
+                    $result = array_values($result);
+                    $result = array_flatten($result);
+                    $result = array_filter($result);
+                    if (!empty($result)) {
+                        $result = array_flip($result);
+                        $result = array_keys($result);
+
+                    }
+                }
+
+            }
+
+            return $result;
+        });
+
+    }
+
+    public function getById($id)
+    {
+        // Optimize array handling to use single query with whereIn instead of N+1
+        if (is_array($id)) {
+            if (empty($id)) {
+                return [];
+            }
+
+            // Ensure all IDs are numeric
+            $ids = array_filter($id, function ($value) {
+                return is_numeric($value) && $value != 0;
+            });
+
+            if (empty($ids)) {
+                return [];
+            }
+
+            return $this->cacheCallback(__FUNCTION__.'_array_'.md5(implode(',', $ids)), func_get_args(), function () use ($ids) {
+                $items = $this->getModel()->newInstance()->newQueryWithoutScopes()
+                    ->whereIn('id', $ids)
+                    ->get()
+                    ->keyBy('id');
+
+                $result = [];
+                foreach ($ids as $key => $idValue) {
+                    $item = $items->get($idValue);
+                    if ($item) {
+                        $item = $item->toArray();
+
+                        if (app()->bound(\MicroweberPackages\Event\EventService::class)) {
+                            $hookParams = [
+                                'data' => $item,
+                                'hook_overwrite_type' => 'single',
+                            ];
+
+                            $overwrite = EventManager::response(get_class($this) . '\\getById', $hookParams);
+                            if (isset($overwrite['data'])) {
+                                $item = $overwrite['data'];
+                            }
+                        }
+
+                        $result[$key] = $item;
+                    }
+                }
+
+                return $result;
+            });
+        }
+
+        if (!is_numeric($id) || $id == 0) {
+            return false;
+        }
+
+        return $this->cacheCallback(__FUNCTION__.$id, func_get_args(), function () use ($id) {
+            $table = $this->getModel()->getTable();
+            $item = $this->getModel()->newInstance()->newQueryWithoutScopes()->where('id', $id)->first();
+
+            if (!$item) {
+                return false;
+            }
+
+            $item = $item->toArray();
+
+            if (app()->bound(\MicroweberPackages\Event\EventService::class)) {
+                $hookParams = [
+                    'data' => $item,
+                    'hook_overwrite_type' => 'single',
+                ];
+
+                $overwrite = EventManager::response(get_class($this) . '\\getById', $hookParams);
+                if (isset($overwrite['data'])) {
+                    $item = $overwrite['data'];
+                }
+            }
+
+            return $item;
+        });
+    }
+}

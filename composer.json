@@ -1,0 +1,50 @@
+{
+    "name": "microweber-packages/microweber-repository",
+    "description": "Reusable Laravel repository pattern package with caching, query filtering and model observers",
+    "type": "library",
+    "license": "MIT",
+    "authors": [
+        {
+            "name": "Microweber",
+            "email": "info@microweber.com"
+        }
+    ],
+    "require": {
+        "php": "^8.2",
+        "illuminate/support": "^10.0|^11.0|^12.0|^13.0",
+        "illuminate/database": "^10.0|^11.0|^12.0|^13.0",
+        "illuminate/cache": "^10.0|^11.0|^12.0|^13.0",
+        "illuminate/events": "^10.0|^11.0|^12.0|^13.0",
+        "microweber-packages/microweber-deps-laravel-repository": "*",
+        "microweber-packages/laravel-helper-functions": "*",
+        "microweber-packages/microweber-package": "*",
+        "spatie/laravel-package-tools": "^1.16",
+        "microweber-packages/microweber-database": "*",
+        "microweber-packages/microweber-event-manager": "*"
+    },
+    "require-dev": {
+        "orchestra/testbench": "^8.0|^9.0|^10.0",
+        "phpunit/phpunit": "^10.0|^11.0"
+    },
+    "autoload": {
+        "psr-4": {
+            "MicroweberPackages\\Repository\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "MicroweberPackages\\Repository\\Tests\\": "tests/"
+        }
+    },
+    "minimum-stability": "dev",
+    "prefer-stable": true,
+    "config": {
+        "sort-packages": true
+    },
+    "scripts": {
+        "test": "vendor/bin/phpunit"
+    },
+    "replace": {
+        "microweber-packages/repository": "*"
+    }
+}
